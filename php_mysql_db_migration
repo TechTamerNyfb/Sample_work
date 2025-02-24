@@ -1,0 +1,95 @@
+<?php
+
+// Configuration (use .env or configuration files in a real production environment)
+$oldHost = getenv('OLD_HOST') ?: 'old_host';
+$oldUser = getenv('OLD_USER') ?: 'old_user';
+$oldPass = getenv('OLD_PASS') ?: 'old_pass';
+$oldDb = getenv('OLD_NAME') ?: 'old_name';
+
+$newHost = getenv('NEW_HOST') ?: 'new_host';
+$newUser = getenv('NEW_USER') ?: 'new_user';
+$newPass = getenv('NEW_PASS') ?: 'new_pass';
+$newDb = getenv('NEW_NAME') ?: 'new_name';
+
+// DB connections with PDO for security and better error handling
+function connDB($host, $user, $pass, $db) {
+    try {
+        $dsn = "mysql:host=$host;dbname=$db;charset=utf8mb4";
+        $options = [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ];
+        $conn = new PDO($dsn, $user, $pass, $options);
+        return $conn;
+    } catch (PDOException $e) {
+        echo "Connection failed: " . $e->getMessage();
+        exit;
+    }
+}
+
+// Migrate data
+function migrateT($oldConn, $newConn, $oldT, $newT, $cols = []) {
+    $colsQuery = empty($cols) ? "*" : implode(", ", $cols);
+
+    // Prepare the SQL query for migration
+    $sql = "INSERT INTO $newT ($colsQuery) SELECT $colsQuery FROM $oldT";
+
+    try {
+        $stmt = $newConn->prepare($sql);
+        $stmt->execute();
+        echo "Migrated: $oldT -> $newT<br>";
+    } catch (PDOException $e) {
+        echo "Error migrating $oldT: " . $e->getMessage() . "<br>";
+    }
+}
+
+// Remove duplicate rows
+function clearDupl($conn, $table, $cols) {
+    if (empty($cols)) return;
+
+    $whereClause = implode(" AND ", array_map(function($col) {
+        return "$col IN (SELECT $col FROM $table GROUP BY $col HAVING COUNT(*) > 1)";
+    }, $cols));
+
+    $sql = "DELETE FROM $table WHERE id NOT IN (SELECT MIN(id) FROM $table WHERE $whereClause GROUP BY " . implode(", ", $cols) . ")";
+
+    try {
+        $stmt = $conn->prepare($sql);
+        $stmt->execute();
+        echo "Duplicates removed from $table<br>";
+    } catch (PDOException $e) {
+        echo "Error removing duplicates from $table: " . $e->getMessage() . "<br>";
+    }
+}
+
+// Main migration script
+try {
+    echo "Are you sure? (yes/no): ";
+    $response = strtolower(trim(fgets(STDIN)));
+    if ($response !== 'yes') {
+        echo "Cancelled.\n";
+        exit;
+    }
+
+    // Establish database connections
+    $oldConn = connDB($oldHost, $oldUser, $oldPass, $oldDb);
+    $newConn = connDB($newHost, $newUser, $newPass, $newDb);
+
+    // Example Usage
+    clearDupl($oldConn, 'old_table_name', ['col_name1', 'col_name2']);
+    migrateT($oldConn, $newConn, 'old_table', 'new_table');
+
+    // You can add more migrations as needed
+    clearDupl($oldConn, 'old_table_name', ['col_name1', 'col_name2', '...']);
+    migrateT($oldConn, $newConn, 'old_table', 'new_table', ['col_name1', 'col_name2']);
+
+    $oldConn = null;
+    $newConn = null;
+    echo "Migration completed!\n";
+
+} catch (Exception $e) {
+    echo "Error: " . $e->getMessage() . "\n";
+}
+
+?>
