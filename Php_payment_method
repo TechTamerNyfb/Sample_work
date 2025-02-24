@@ -1,0 +1,212 @@
+<?php 
+// Ensure the session is started securely
+session_start();
+
+// Regenerate session ID to prevent session fixation attacks
+if (!isset($_SESSION['initiated'])) {
+    session_regenerate_id(true);
+    $_SESSION['initiated'] = true;
+}
+
+// Set secure session parameters
+ini_set('session.cookie_secure', 1); // Use secure cookies only (ensure the site is served over HTTPS)
+ini_set('session.cookie_httponly', 1); // Prevent access to session cookie via JavaScript
+ini_set('session.use_only_cookies', 1); // Force session to use cookies for session ID (not URL)
+ini_set('session.gc_maxlifetime', 3600); // Set session expiration time to 1 hour
+
+// Check if the session is still valid (e.g., session timeout)
+if (isset($_SESSION['last_activity']) && (time() - $_SESSION['last_activity']) > 3600) {
+    // If the session has expired, destroy it
+    session_unset();
+    session_destroy();
+    header('Location: login.php');
+    exit;
+}
+
+// Update the last activity time
+$_SESSION['last_activity'] = time();
+
+// Include Stripe's PHP library for secure payment handling
+require_once('vendor/autoload.php');
+\Stripe\Stripe::setApiKey('your_stripe_secret_key');
+
+// Generate a unique request ID for each transaction
+$r = uniqid();
+
+// Include email processing functionality
+include_once('bin/emailQuote.php');
+
+// Set error reporting to log errors and display them only during development
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+
+// Error handling function
+function handleError($message, $pdo = null) {
+    // Log error message to a file
+    error_log($message, 3, 'error_log.txt');
+    
+    // Optionally log PDO error info if it's available
+    if ($pdo) {
+        error_log('PDO Error: ' . implode(', ', $pdo->errorInfo()), 3, 'error_log.txt');
+    }
+    
+    // Display a generic error message to the user (avoid exposing sensitive details)
+    echo "An error occurred. Please try again later.";
+    exit;
+}
+
+// Sanitize input function
+function sanitize_input($data) {
+    return htmlspecialchars(trim($data));
+}
+
+// Validate email format
+function validate_email($email) {
+    return filter_var($email, FILTER_VALIDATE_EMAIL) !== false;
+}
+
+// Validate phone number (digits only, length 10-15)
+function validate_phone($phone) {
+    return preg_match('/^[0-9]{10,15}$/', $phone);
+}
+
+// Luhn algorithm to validate credit card numbers
+function validate_card_number($card_number) {
+    $sum = 0;
+    $num_digits = strlen($card_number);
+    $parity = $num_digits % 2;
+    
+    for ($i = 0; $i < $num_digits; $i++) {
+        $digit = (int)$card_number[$i];
+        
+        // Double every other digit
+        if ($i % 2 == $parity) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;  // If doubling results in a number > 9, subtract 9
+            }
+        }
+        $sum += $digit;
+    }
+    
+    return $sum % 10 == 0;  // Valid if sum is divisible by 10
+}
+
+// Validation and processing logic
+try {
+    // Process billing information
+    if (isset($_POST['fname'], $_POST['lname'], $_POST['email'], $_POST['phone'], $_POST['addr'], $_POST['city'], $_POST['state'], $_POST['zip'], $_POST['cntry'])) {
+        // Sanitize inputs
+        $fname = sanitize_input($_POST['fname']);
+        $lname = sanitize_input($_POST['lname']);
+        $email = sanitize_input($_POST['email']);
+        $phone = sanitize_input($_POST['phone']);
+        $addr = sanitize_input($_POST['addr']);
+        $addr2 = isset($_POST['addr2']) ? sanitize_input($_POST['addr2']) : '';
+        $city = sanitize_input($_POST['city']);
+        $state = sanitize_input($_POST['state']);
+        $zip = sanitize_input($_POST['zip']);
+        $cntry = sanitize_input($_POST['cntry']);
+
+        // Validate email
+        if (!validate_email($email)) {
+            handleError('Invalid email address.');
+        }
+
+        // Validate phone number
+        if (!validate_phone($phone)) {
+            handleError('Invalid phone number. Please provide a valid number with 10-15 digits.');
+        }
+
+        // Insert billing information into the database
+        $sql = 'INSERT INTO table_name
+                (date_time, cust_id, fname, lname, email, comp, phone, fax, addr, addr2, city, state, zip, cntry,
+                ship_fname, ship_lname, ship_addr, ship_addr2, ship_city, ship_state, ship_zip, ship_cntry) 
+                VALUES 
+                (NOW(), :r, :fname, :lname, :email, :comp, :phone, :fax, :addr, :addr2, :city, :state, :zip, :cntry,
+                :ship_fname, :ship_lname, :ship_addr, :ship_addr2, :ship_city, :ship_state, :ship_zip, :ship_cntry)';
+        
+        $stmt = $pdo->prepare($sql);
+        if (!$stmt->execute(array(
+            ":r" => $r, 
+            ":fname" => $fname,
+            ":lname" => $lname,
+            ":email" => $email,
+            ":comp" => sanitize_input($_POST['comp']),
+            ":phone" => $phone,
+            ":fax" => sanitize_input($_POST['fax']),
+            ":addr" => $addr,
+            ":addr2" => $addr2,
+            ":city" => $city,
+            ":state" => $state,
+            ":zip" => $zip,
+            ":cntry" => $cntry,
+            ":ship_fname" => sanitize_input($_POST['ship_fname']),
+            ":ship_lname" => sanitize_input($_POST['ship_lname']),
+            ":ship_addr" => sanitize_input($_POST['ship_addr']),
+            ":ship_addr2" => sanitize_input($_POST['ship_addr2']),
+            ":ship_city" => sanitize_input($_POST['ship_city']),
+            ":ship_state" => sanitize_input($_POST['ship_state']),
+            ":ship_zip" => sanitize_input($_POST['ship_zip']),
+            ":ship_cntry" => sanitize_input($_POST['ship_cntry'])
+        ))) {
+            handleError('Error inserting billing information into the database.', $pdo);
+        }
+    }
+
+    // Process payment information
+    if (isset($_POST['stripeToken'])) {
+        try {
+            // Retrieve Stripe Token
+            $token = sanitize_input($_POST['stripeToken']);
+            
+            // Validate card number using the Luhn algorithm
+            $card_number = sanitize_input($_POST['num']);
+            if (!validate_card_number($card_number)) {
+                handleError('Invalid card number. Please check your credit card details.');
+            }
+
+            // Process payment via Stripe
+            $charge = \Stripe\PaymentIntent::create([
+                'amount' => $_POST['total'] * 100,  // Convert to cents
+                'currency' => 'usd',  // Replace with your currency
+                'payment_method' => $token,
+                'confirmation_method' => 'manual',
+                'confirm' => true,
+            ]);
+
+            // Insert payment information into the database
+            $sql = 'INSERT INTO table_name
+                    (cust_id, card_type, card_name, card_num, card_month, card_year, card_cvv, payment_status)
+                    VALUES 
+                    (:r, :type, :name, :num, :month, :year, :cvv, :status)';
+            
+            $stmt = $pdo->prepare($sql);
+            if (!$stmt->execute(array(
+                ":r" => $r,
+                ":type" => $_POST['type'],
+                ":name" => $_POST['name'],
+                ":num" => $card_number,
+                ":month" => $_POST['month'],
+                ":year" => $_POST['year'],
+                ":cvv" => $_POST['cvv'],
+                ":status" => $charge->status
+            ))) {
+                handleError('Error inserting payment information into the database.', $pdo);
+            }
+
+            // Redirect to success page
+            header('Location: thankyou');
+            exit;
+
+        } catch (\Stripe\Exception\ApiErrorException $e) {
+            handleError('Stripe API Error: ' . $e->getMessage());
+        } catch (Exception $e) {
+            handleError('Payment processing failed: ' . $e->getMessage());
+        }
+    }
+
+} catch (Exception $e) {
+    handleError('An unexpected error occurred: ' . $e->getMessage());
+}
+?>
